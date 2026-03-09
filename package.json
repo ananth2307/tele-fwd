@@ -1,0 +1,17 @@
+{
+  "name": "tele-fwd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram channel forwarder",
+  "main": "telegram_channel_forwarder.js",
+  "scripts": {
+    "start": "node telegram_channel_forwarder.js",
+    "dev": "nodemon telegram_channel_forwarder.js",
+    "session:generate": "node generate_session_string.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "nodemon": "^3.1.14",
+    "telegram": "^2.26.22"
+  }
+}
