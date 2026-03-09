@@ -1,6 +1,10 @@
 # Telegram Channel Forwarder (Railway Ready)
 
-Forwards every new message from one Telegram channel to your target channel.
+Forwards messages from one Telegram channel to your target channel.
+
+Supports two modes:
+- Live forward of every new message.
+- HTTP trigger to forward only the latest message on demand.
 
 ## 1) Install
 
@@ -20,6 +24,9 @@ Required variables:
 - `TELEGRAM_SESSION_STRING` (required for Railway/non-interactive runtime)
 - `TELEGRAM_USE_WSS` (`1` recommended)
 - `TELEGRAM_CONNECT_TIMEOUT` (seconds, e.g. `30`)
+- `ENABLE_LIVE_FORWARD` (`1` to auto-forward new messages, `0` to disable)
+- `HTTP_PORT` (default `3000`, Railway can override with `PORT`)
+- `FORWARD_ENDPOINT_TOKEN` (optional but recommended for endpoint auth)
 
 ## 3) Generate session string (one-time, local)
 
@@ -35,7 +42,27 @@ Copy output and set it in Railway as `TELEGRAM_SESSION_STRING`.
 npm start
 ```
 
-## 5) Deploy on Railway
+## 5) Trigger latest message forward via endpoint
+
+Health check:
+
+```bash
+curl http://localhost:3000/health
+```
+
+Forward latest message:
+
+```bash
+curl "http://localhost:3000/get-last-msg?token=change_me"
+```
+
+Or with header:
+
+```bash
+curl -H "x-forward-token: change_me" http://localhost:3000/get-last-msg
+```
+
+## 6) Deploy on Railway
 
 1. Push this project to GitHub.
 2. In Railway: `New Project` -> `Deploy from GitHub Repo`.

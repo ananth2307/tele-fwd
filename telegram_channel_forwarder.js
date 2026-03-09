@@ -12,8 +12,10 @@
  */
 
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 const readline = require("readline/promises");
+const { URL } = require("url");
 const { stdin: input, stdout: output } = require("process");
 require("dotenv").config();
 
@@ -70,12 +72,20 @@ async function promptText(rl, question) {
   return value.trim();
 }
 
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}
+
 async function main() {
   const apiIdRaw = requiredEnv("TELEGRAM_API_ID");
   const apiHash = requiredEnv("TELEGRAM_API_HASH");
   const targetChatIdRaw = requiredEnv("TELEGRAM_ALERT_CHAT_ID");
   const useWSS = (process.env.TELEGRAM_USE_WSS || "1").trim() !== "0";
   const connectTimeoutSeconds = Number.parseInt(process.env.TELEGRAM_CONNECT_TIMEOUT || "30", 10);
+  const endpointPort = Number.parseInt(process.env.HTTP_PORT || process.env.PORT || "3000", 10);
+  const endpointToken = (process.env.FORWARD_ENDPOINT_TOKEN || "").trim();
+  const enableLiveForward = (process.env.ENABLE_LIVE_FORWARD || "1").trim() !== "0";
 
   const apiId = Number.parseInt(apiIdRaw, 10);
   if (!Number.isInteger(apiId)) throw new Error("TELEGRAM_API_ID must be an integer");
@@ -86,6 +96,9 @@ async function main() {
   }
   if (!Number.isInteger(connectTimeoutSeconds) || connectTimeoutSeconds < 1) {
     throw new Error("TELEGRAM_CONNECT_TIMEOUT must be a positive integer");
+  }
+  if (!Number.isInteger(endpointPort) || endpointPort < 1 || endpointPort > 65535) {
+    throw new Error("HTTP_PORT/PORT must be a valid port number");
   }
 
   const sessionFromEnv = cleanSession(
@@ -166,26 +179,83 @@ async function main() {
     console.log(`- About: ${channelDetails.about}`);
   }
   console.log(`Forwarding to chat id: ${targetChatId}`);
+  console.log(`Live forward mode: ${enableLiveForward ? "enabled" : "disabled"}`);
 
-  client.addEventHandler(
-    async (event) => {
-      if (!event.isChannel) return;
-      if (event.chatId === undefined || BigInt(event.chatId) !== sourceChatId) return;
+  async function forwardLastMessage() {
+    const messages = await client.getMessages(sourceEntity, { limit: 1 });
+    const lastMessage = messages && messages.length ? messages[0] : null;
+    if (!lastMessage) {
+      return { forwarded: false, reason: "No messages found in source channel" };
+    }
+    await client.forwardMessages(targetChatId, {
+      messages: [lastMessage.id],
+      fromPeer: sourceEntity,
+    });
+    return { forwarded: true, messageId: lastMessage.id };
+  }
 
-      try {
-        await client.forwardMessages(targetChatId, {
-          messages: [event.message.id],
-          fromPeer: sourceEntity,
-        });
-        console.log(`Forwarded message id ${event.message.id}`);
-      } catch (err) {
-        console.error(`Failed to forward message id ${event.message.id}:`, err?.message || err);
+  if (enableLiveForward) {
+    client.addEventHandler(
+      async (event) => {
+        if (!event.isChannel) return;
+        if (event.chatId === undefined || BigInt(event.chatId) !== sourceChatId) return;
+
+        try {
+          await client.forwardMessages(targetChatId, {
+            messages: [event.message.id],
+            fromPeer: sourceEntity,
+          });
+          console.log(`Forwarded live message id ${event.message.id}`);
+        } catch (err) {
+          console.error(`Failed to forward live message id ${event.message.id}:`, err?.message || err);
+        }
+      },
+      new NewMessage({})
+    );
+  }
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const host = req.headers.host || `127.0.0.1:${endpointPort}`;
+      const url = new URL(req.url || "/", `http://${host}`);
+      const method = req.method || "GET";
+
+      if (url.pathname === "/health") {
+        return sendJson(res, 200, { ok: true });
       }
-    },
-    new NewMessage({})
-  );
 
-  console.log("Forwarder is running. Press Ctrl+C to stop.");
+      if (url.pathname !== "/get-last-msg") {
+        return sendJson(res, 404, { ok: false, error: "Not found" });
+      }
+
+      if (method !== "GET" && method !== "POST") {
+        return sendJson(res, 405, { ok: false, error: "Use GET or POST" });
+      }
+
+      const providedToken = (url.searchParams.get("token") || req.headers["x-forward-token"] || "").toString();
+      if (endpointToken && providedToken !== endpointToken) {
+        return sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      }
+
+      const result = await forwardLastMessage();
+      if (result.forwarded) {
+        console.log(`Forwarded latest message via endpoint: ${result.messageId}`);
+      } else {
+        console.log(`Endpoint hit but nothing forwarded: ${result.reason}`);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (err) {
+      console.error("Endpoint error:", err?.message || err);
+      return sendJson(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  server.listen(endpointPort, "0.0.0.0", () => {
+    console.log(`HTTP endpoint listening on port ${endpointPort}`);
+    console.log("Trigger latest forward with: GET/POST /get-last-msg");
+  });
+
+  console.log("Service is running. Press Ctrl+C to stop.");
 }
 
 main().catch((err) => {
