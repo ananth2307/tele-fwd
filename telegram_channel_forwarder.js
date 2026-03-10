@@ -90,6 +90,56 @@ async function main() {
   const enableLiveForward = (process.env.ENABLE_LIVE_FORWARD || "1").trim() !== "0";
   const pollingIntervalMs = Number.parseInt(process.env.POLLING_INTERVAL_MS || "30000", 10);
 
+  // ─── HTTP endpoint ───────────────────────────────────────────────────────────
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const host = req.headers.host || `127.0.0.1:${endpointPort}`;
+      const url = new URL(req.url || "/", `http://${host}`);
+      const method = req.method || "GET";
+
+      if (url.pathname === "/health") {
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (url.pathname !== "/get-last-msg") {
+        return sendJson(res, 404, { ok: false, error: "Not found" });
+      }
+
+      if (method !== "GET" && method !== "POST") {
+        return sendJson(res, 405, { ok: false, error: "Use GET or POST" });
+      }
+
+      const providedToken = (
+        url.searchParams.get("token") ||
+        req.headers["x-forward-token"] ||
+        ""
+      ).toString();
+      if (endpointToken && providedToken !== endpointToken) {
+        return sendJson(res, 401, { ok: false, error: "Unauthorized" });
+      }
+
+      const result = await forwardLastMessage();
+      if (result.forwarded) {
+        console.log(`Forwarded latest message via endpoint: ${result.messageId}`);
+      } else {
+        console.log(`Endpoint hit but nothing forwarded: ${result.reason}`);
+      }
+      return sendJson(res, 200, { ok: true, ...result });
+    } catch (err) {
+      console.error("Endpoint error:", err?.message || err);
+      return sendJson(res, 500, { ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  server.listen(endpointPort, "0.0.0.0", () => {
+    console.log(`🌐 HTTP endpoint listening on port ${endpointPort}`);
+    console.log("   GET /health        → health check");
+    console.log("   GET /get-last-msg  → manually trigger forward of latest message");
+  });
+
+  console.log("✅ Service is running. Press Ctrl+C to stop.");
+
   const apiId = Number.parseInt(apiIdRaw, 10);
   if (!Number.isInteger(apiId)) throw new Error("TELEGRAM_API_ID must be an integer");
 
@@ -127,7 +177,7 @@ async function main() {
   if (!hasSession && !input.isTTY) {
     throw new Error(
       "No TELEGRAM_SESSION_STRING found for non-interactive runtime. " +
-        "Generate it locally and set it in Railway variables."
+      "Generate it locally and set it in Railway variables."
     );
   }
 
@@ -287,56 +337,6 @@ async function main() {
   }, pollingIntervalMs);
 
   console.log(`🔄 Polling fallback active every ${pollingIntervalMs / 1000}s`);
-
-  // ─── HTTP endpoint ───────────────────────────────────────────────────────────
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      const host = req.headers.host || `127.0.0.1:${endpointPort}`;
-      const url = new URL(req.url || "/", `http://${host}`);
-      const method = req.method || "GET";
-
-      if (url.pathname === "/health") {
-        return sendJson(res, 200, { ok: true });
-      }
-
-      if (url.pathname !== "/get-last-msg") {
-        return sendJson(res, 404, { ok: false, error: "Not found" });
-      }
-
-      if (method !== "GET" && method !== "POST") {
-        return sendJson(res, 405, { ok: false, error: "Use GET or POST" });
-      }
-
-      const providedToken = (
-        url.searchParams.get("token") ||
-        req.headers["x-forward-token"] ||
-        ""
-      ).toString();
-      if (endpointToken && providedToken !== endpointToken) {
-        return sendJson(res, 401, { ok: false, error: "Unauthorized" });
-      }
-
-      const result = await forwardLastMessage();
-      if (result.forwarded) {
-        console.log(`Forwarded latest message via endpoint: ${result.messageId}`);
-      } else {
-        console.log(`Endpoint hit but nothing forwarded: ${result.reason}`);
-      }
-      return sendJson(res, 200, { ok: true, ...result });
-    } catch (err) {
-      console.error("Endpoint error:", err?.message || err);
-      return sendJson(res, 500, { ok: false, error: err?.message || String(err) });
-    }
-  });
-
-  server.listen(endpointPort, "0.0.0.0", () => {
-    console.log(`🌐 HTTP endpoint listening on port ${endpointPort}`);
-    console.log("   GET /health        → health check");
-    console.log("   GET /get-last-msg  → manually trigger forward of latest message");
-  });
-
-  console.log("✅ Service is running. Press Ctrl+C to stop.");
 }
 
 main().catch((err) => {
