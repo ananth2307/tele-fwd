@@ -7,8 +7,10 @@
  *   TELEGRAM_API_ID=34475076
  *   TELEGRAM_API_HASH=...
  *   TELEGRAM_ALERT_CHAT_ID=-1002853790251
- *   TELEGRAM_SOURCE_CHANNEL="Univest Official"      (optional, default shown)
- *   TELEGRAM_SESSION_STRING="..."                   (optional; saved to .telegram_session if absent)
+ *   TELEGRAM_SOURCE_CHANNEL=-1001983880498   (optional, defaults to Univest Official ID)
+ *   TELEGRAM_SESSION_STRING="..."            (optional; saved to .telegram_session if absent)
+ *   ENABLE_LIVE_FORWARD=1                    (set to 0 to disable live forwarding)
+ *   POLLING_INTERVAL_MS=30000               (polling fallback interval, default 30s)
  */
 
 const fs = require("fs");
@@ -20,12 +22,12 @@ const { stdin: input, stdout: output } = require("process");
 require("dotenv").config();
 
 const { TelegramClient } = require("telegram");
-const { utils } = require("telegram");
 const { Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 
-const SOURCE_CHANNEL = process.env.TELEGRAM_SOURCE_CHANNEL || "Univest Official";
+// Use channel ID instead of name — much more reliable
+const SOURCE_CHANNEL = process.env.TELEGRAM_SOURCE_CHANNEL || "-1001983880498";
 const SESSION_FILE = path.join(process.cwd(), ".telegram_session");
 
 function requiredEnv(name) {
@@ -86,6 +88,7 @@ async function main() {
   const endpointPort = Number.parseInt(process.env.HTTP_PORT || process.env.PORT || "3000", 10);
   const endpointToken = (process.env.FORWARD_ENDPOINT_TOKEN || "").trim();
   const enableLiveForward = (process.env.ENABLE_LIVE_FORWARD || "1").trim() !== "0";
+  const pollingIntervalMs = Number.parseInt(process.env.POLLING_INTERVAL_MS || "30000", 10);
 
   const apiId = Number.parseInt(apiIdRaw, 10);
   if (!Number.isInteger(apiId)) throw new Error("TELEGRAM_API_ID must be an integer");
@@ -115,6 +118,7 @@ async function main() {
     connectionRetries: 20,
     requestRetries: 10,
     retryDelay: 2000,
+    sequentialUpdates: true, // Ensures updates are processed in order
   });
 
   const hasSession = Boolean(sessionFromEnv || sessionFromFile);
@@ -161,7 +165,12 @@ async function main() {
   const sourceEntity = await resolveSourceEntity(client, SOURCE_CHANNEL);
   const channelDetails = await getChannelDetails(client, sourceEntity);
   const sourceChat = channelDetails.chat || sourceEntity;
-  const sourceChatId = BigInt(utils.getPeerId(sourceEntity));
+
+  // FIX: Use raw positive ID (sourceEntity.id) for event comparison.
+  // utils.getPeerId() returns the -100 prefixed version, but event.chatId
+  // is always the raw positive ID — so they would never match.
+  const sourceRawId = BigInt(sourceEntity.id);
+
   const sourceTitle = sourceChat.title || SOURCE_CHANNEL;
   const sourceUsername = sourceChat.username ? `@${sourceChat.username}` : "N/A";
   const sourceMembers =
@@ -173,13 +182,15 @@ async function main() {
   console.log("Listening channel details:");
   console.log(`- Name: ${sourceTitle}`);
   console.log(`- Username: ${sourceUsername}`);
-  console.log(`- Chat ID: ${sourceChatId.toString()}`);
+  console.log(`- Raw ID: ${sourceRawId.toString()}`);
   console.log(`- Members/Subscribers: ${sourceMembers}`);
   if (channelDetails.about) {
     console.log(`- About: ${channelDetails.about}`);
   }
   console.log(`Forwarding to chat id: ${targetChatId}`);
   console.log(`Live forward mode: ${enableLiveForward ? "enabled" : "disabled"}`);
+
+  // ─── Forward helpers ────────────────────────────────────────────────────────
 
   async function forwardLastMessage() {
     const messages = await client.getMessages(sourceEntity, { limit: 1 });
@@ -194,25 +205,90 @@ async function main() {
     return { forwarded: true, messageId: lastMessage.id };
   }
 
+  // ─── Live event-based forwarding ────────────────────────────────────────────
+
   if (enableLiveForward) {
     client.addEventHandler(
       async (event) => {
-        if (!event.isChannel) return;
-        if (event.chatId === undefined || BigInt(event.chatId) !== sourceChatId) return;
+        // Debug: log every incoming event so we can confirm events are firing
+        console.log(
+          "RAW EVENT — chatId:",
+          event.chatId?.toString() ?? "undefined",
+          "| sourceRawId:",
+          sourceRawId.toString()
+        );
 
         try {
+          // Guard: must have a message and a chatId
+          if (!event.message || event.chatId == null) return;
+
+          // FIX: Compare raw positive IDs (no -100 prefix on event.chatId)
+          if (BigInt(event.chatId) !== sourceRawId) return;
+
+          // Confirm it's a channel/supergroup peer (not a DM or group)
+          const peer = event.message.peerId;
+          const isChannelMsg =
+            peer?.className === "PeerChannel" || peer?.className === "PeerChat";
+          if (!isChannelMsg) return;
+
           await client.forwardMessages(targetChatId, {
             messages: [event.message.id],
             fromPeer: sourceEntity,
           });
-          console.log(`Forwarded live message id ${event.message.id}`);
+          console.log(`✅ Forwarded live message id ${event.message.id}`);
         } catch (err) {
-          console.error(`Failed to forward live message id ${event.message.id}:`, err?.message || err);
+          console.error(
+            `❌ Failed to forward live message id ${event.message?.id}:`,
+            err?.message || err
+          );
         }
       },
       new NewMessage({})
     );
+
+    console.log("👂 Live event listener registered.");
   }
+
+  // ─── Polling fallback ────────────────────────────────────────────────────────
+  // Broadcast channels sometimes throttle MTProto update delivery.
+  // This polling loop catches anything the event handler misses.
+
+  let lastSeenMessageId = null;
+
+  // Seed the last seen ID on startup so we don't re-forward old messages
+  try {
+    const seedMessages = await client.getMessages(sourceEntity, { limit: 1 });
+    if (seedMessages && seedMessages.length) {
+      lastSeenMessageId = seedMessages[0].id;
+      console.log(`📌 Polling seeded at message id: ${lastSeenMessageId}`);
+    }
+  } catch (err) {
+    console.warn("Could not seed last message id for polling:", err?.message || err);
+  }
+
+  setInterval(async () => {
+    try {
+      const messages = await client.getMessages(sourceEntity, { limit: 1 });
+      if (!messages || !messages.length) return;
+
+      const latest = messages[0];
+      if (lastSeenMessageId === null || latest.id > lastSeenMessageId) {
+        console.log(`📡 Polling detected new message id ${latest.id} — forwarding...`);
+        await client.forwardMessages(targetChatId, {
+          messages: [latest.id],
+          fromPeer: sourceEntity,
+        });
+        console.log(`✅ Polling forwarded message id ${latest.id}`);
+        lastSeenMessageId = latest.id;
+      }
+    } catch (err) {
+      console.error("Polling error:", err?.message || err);
+    }
+  }, pollingIntervalMs);
+
+  console.log(`🔄 Polling fallback active every ${pollingIntervalMs / 1000}s`);
+
+  // ─── HTTP endpoint ───────────────────────────────────────────────────────────
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -232,7 +308,11 @@ async function main() {
         return sendJson(res, 405, { ok: false, error: "Use GET or POST" });
       }
 
-      const providedToken = (url.searchParams.get("token") || req.headers["x-forward-token"] || "").toString();
+      const providedToken = (
+        url.searchParams.get("token") ||
+        req.headers["x-forward-token"] ||
+        ""
+      ).toString();
       if (endpointToken && providedToken !== endpointToken) {
         return sendJson(res, 401, { ok: false, error: "Unauthorized" });
       }
@@ -251,11 +331,12 @@ async function main() {
   });
 
   server.listen(endpointPort, "0.0.0.0", () => {
-    console.log(`HTTP endpoint listening on port ${endpointPort}`);
-    console.log("Trigger latest forward with: GET/POST /get-last-msg");
+    console.log(`🌐 HTTP endpoint listening on port ${endpointPort}`);
+    console.log("   GET /health        → health check");
+    console.log("   GET /get-last-msg  → manually trigger forward of latest message");
   });
 
-  console.log("Service is running. Press Ctrl+C to stop.");
+  console.log("✅ Service is running. Press Ctrl+C to stop.");
 }
 
 main().catch((err) => {
